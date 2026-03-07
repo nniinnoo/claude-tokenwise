@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { select, input, confirm } from '@inquirer/prompts';
+import { select, input, confirm, checkbox } from '@inquirer/prompts';
 import chalk from 'chalk';
 import {
   createSession,
@@ -13,11 +13,28 @@ import {
 import { spawn } from 'child_process';
 import { createInterface } from 'readline';
 import ora from 'ora';
+import { marked } from 'marked';
+import { markedTerminal } from 'marked-terminal';
+
+marked.use(markedTerminal({
+  width: process.stdout.columns || 80,
+  reflowText: true,
+  code: chalk.green,
+  codespan: chalk.yellow,
+  heading: chalk.bold.cyan,
+  firstHeading: chalk.bold.cyan.underline,
+  strong: chalk.bold.white,
+  em: chalk.italic.magenta,
+  blockquote: chalk.dim.italic,
+  link: chalk.blue.underline
+}));
 
 // ── Custom input with ghost text autocomplete ─────
 
 const AUTOCOMPLETE_RULES = [
   { trigger: 'quit', completion: 'cw', full: 'quitcw' },
+  { trigger: 'cw', completion: 'quit', full: 'cwquit' },
+  { trigger: 'cw', completion: 'history', full: 'cwhistory' },
 ];
 
 function promptInput(label) {
@@ -32,7 +49,7 @@ function promptInput(label) {
     });
 
     // Hide default output — we render manually
-    rl.output = { write: () => {} };
+    rl.output = { write: () => { } };
 
     let current = '';
 
@@ -209,7 +226,7 @@ function runClaude(prompt, claudeSessionId) {
         text = rawOutput;
       }
 
-      process.stdout.write(text);
+      console.log(marked.parse(text));
       resolve({ text, sessionId });
     });
   });
@@ -298,6 +315,72 @@ async function showHistory() {
   }
 }
 
+// ── Manage Sessions mode ──────────────────────────
+
+async function manageSessions() {
+  const sessions = listSessions();
+  if (sessions.length === 0) {
+    console.log(chalk.dim('\n  No sessions found.\n'));
+    return null; // Return to picker
+  }
+
+  while (true) {
+    const currentSessions = listSessions();
+    if (currentSessions.length === 0) {
+      console.log(chalk.dim('  All sessions cleared.\n'));
+      return null;
+    }
+
+    // Immediately show checkboxes corresponding to sessions
+    const selections = await checkbox({
+      message: 'Select sessions to manage',
+      choices: currentSessions.map((s) => ({
+        name: `${chalk.dim(formatTime(s.lastActiveAt).padEnd(8))} ${truncate(s.label, 40).padEnd(42)}`,
+        value: s.id,
+      })),
+      theme: { prefix: chalk.cyan('?') },
+    });
+
+    if (selections.length === 0) {
+      return null; // Go back
+    }
+
+    const manageAction = await select({
+      message: `Selected ${selections.length} session(s)`,
+      choices: [
+        { name: chalk.green(selections.length === 1 ? 'Resume / View' : 'View Multiple (Resume First)'), value: 'resume' },
+        { name: chalk.red('Delete'), value: 'delete' },
+        { name: chalk.dim('← Back'), value: 'back' },
+      ],
+      theme: { prefix: chalk.cyan('?') },
+    });
+
+    if (manageAction === 'resume') {
+      for (const id of selections) {
+        const picked = currentSessions.find((s) => s.id === id);
+        if (selections.length > 1) {
+          console.log(chalk.bold(`\n  --- Viewing Session: ${picked.label} ---`));
+        }
+        await showSessionHistory(picked);
+      }
+      // Resume the first selected session after viewing
+      return currentSessions.find((s) => s.id === selections[0]);
+    } else if (manageAction === 'delete') {
+      const sure = await confirm({
+        message: `Delete ${selections.length} session(s)?`,
+        default: false,
+        theme: { prefix: chalk.red('!') },
+      });
+      if (sure) {
+        selections.forEach((id) => deleteSession(id));
+        console.log(chalk.dim(`  Deleted ${selections.length} session(s).\n`));
+      }
+    }
+  }
+}
+
+
+
 // ── Show conversation history ─────────────────────
 
 async function showSessionHistory(session) {
@@ -339,7 +422,7 @@ async function showSessionHistory(session) {
     console.log(chalk.bold.cyan('  > ') + task.task);
     console.log('');
     if (task.response) {
-      console.log(task.response);
+      console.log(marked.parse(task.response));
     } else {
       console.log(chalk.dim('  (no response saved)'));
     }
@@ -362,12 +445,13 @@ async function pickSession() {
     message: 'Session',
     choices: [
       { name: chalk.green('+ New session'), value: '__new' },
+      { name: chalk.blue('⚙ Manage sessions'), value: '__manage' },
       ...sessions.slice(0, 5).map((s) => ({
         name: `${chalk.dim(formatTime(s.lastActiveAt).padEnd(8))} ${truncate(s.label, 40).padEnd(42)} ${chalk.dim(`~${s.totalEstimatedTokens.toLocaleString()} tokens`)}`,
         value: s.id,
       })),
       ...(sessions.length > 5
-        ? [{ name: chalk.dim(`  ... ${sessions.length - 5} more (use cw -h)`), value: '__new' }]
+        ? [{ name: chalk.dim(`  ... ${sessions.length - 5} more (use cw -h)`), value: '__manage' }]
         : []),
     ],
     theme: { prefix: chalk.cyan('?') },
@@ -375,6 +459,15 @@ async function pickSession() {
 
   if (choice === '__new') {
     return createSession();
+  }
+
+  if (choice === '__manage') {
+    const resumed = await manageSessions();
+    if (resumed) {
+      return resumed;
+    }
+    // Return to main pickSession loop directly if back out from manage
+    return pickSession();
   }
 
   const resumed = readSession(choice);
@@ -390,10 +483,22 @@ async function promptLoop(session) {
 
     if (!task.trim()) continue;
 
-    // Exit keyword
-    if (task.trim().toLowerCase() === 'quitcw') {
+    const lowerTask = task.trim().toLowerCase();
+
+    // Exit keywords
+    if (lowerTask === 'quitcw' || lowerTask === 'cwquit') {
       console.log(chalk.dim('  Session ended.\n'));
       process.exit(0);
+    }
+
+    // History keyword
+    if (lowerTask === 'cwhistory') {
+      const resumed = await manageSessions();
+      if (resumed) {
+        console.log(chalk.dim(`\n  Switched to session: ${resumed.label}\n`));
+        session = resumed; // Update current session context
+      }
+      continue;
     }
 
     // Set label from first prompt
@@ -459,7 +564,7 @@ async function main() {
 
   // Handle flags
   if (args.includes('-h') || args.includes('--history')) {
-    const resumed = await showHistory();
+    const resumed = await manageSessions();
     if (resumed) {
       console.log(chalk.dim(`  Resuming: ${resumed.label}\n`));
       await promptLoop(resumed);
