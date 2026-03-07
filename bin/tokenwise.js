@@ -1,8 +1,15 @@
 #!/usr/bin/env node
 
-import { select, input } from '@inquirer/prompts';
+import { select, input, confirm } from '@inquirer/prompts';
 import chalk from 'chalk';
-import { readSession, writeSession, estimateTokens } from '../lib/tracker.js';
+import {
+  createSession,
+  readSession,
+  writeSession,
+  listSessions,
+  deleteSession,
+  estimateTokens,
+} from '../lib/tracker.js';
 import { spawn } from 'child_process';
 
 const MODES = {
@@ -38,33 +45,213 @@ const MODE_CHOICES = [
   },
 ];
 
-function runClaude(prompt) {
+function runClaude(prompt, claudeSessionId) {
   return new Promise((resolve) => {
-    const claude = spawn('claude', ['-p', prompt], {
+    const args = ['-p', prompt, '--output-format', 'json'];
+    if (claudeSessionId) {
+      args.push('-r', claudeSessionId);
+    }
+
+    const claude = spawn('claude', args, {
       stdio: ['inherit', 'pipe', 'inherit'],
+      env: { ...process.env, CLAUDECODE: undefined },
     });
 
-    let output = '';
+    let rawOutput = '';
 
     claude.stdout.on('data', (data) => {
-      const text = data.toString();
-      output += text;
-      process.stdout.write(text);
+      rawOutput += data.toString();
     });
 
-    claude.on('close', () => resolve(output));
+    claude.on('close', () => {
+      let text = '';
+      let sessionId = null;
+
+      try {
+        const json = JSON.parse(rawOutput);
+        text = json.result || rawOutput;
+        sessionId = json.session_id || null;
+      } catch {
+        text = rawOutput;
+      }
+
+      process.stdout.write(text);
+      resolve({ text, sessionId });
+    });
   });
 }
 
-async function promptLoop() {
-  // Show banner
-  console.log(chalk.bold('\n  cw') + chalk.dim(' — cost-aware Claude Code'));
-  console.log(chalk.dim('  ctrl+c to exit\n'));
+function formatTime(isoString) {
+  const d = new Date(isoString);
+  const now = new Date();
+  const diff = now - d;
+  const mins = Math.floor(diff / 60000);
+  const hours = Math.floor(diff / 3600000);
+  const days = Math.floor(diff / 86400000);
 
-  const session = readSession();
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  if (hours < 24) return `${hours}h ago`;
+  return `${days}d ago`;
+}
+
+function truncate(str, len) {
+  return str.length > len ? str.slice(0, len - 1) + '…' : str;
+}
+
+// ── History mode ──────────────────────────────────
+
+async function showHistory() {
+  const sessions = listSessions();
+
+  if (sessions.length === 0) {
+    console.log(chalk.dim('\n  No sessions found.\n'));
+    process.exit(0);
+  }
+
+  console.log(chalk.bold('\n  Session history\n'));
 
   while (true) {
-    // Ask for task
+    const currentSessions = listSessions();
+    if (currentSessions.length === 0) {
+      console.log(chalk.dim('  All sessions cleared.\n'));
+      process.exit(0);
+    }
+
+    const action = await select({
+      message: 'Pick a session',
+      choices: [
+        ...currentSessions.map((s) => ({
+          name: `${chalk.dim(formatTime(s.lastActiveAt).padEnd(8))} ${truncate(s.label, 40).padEnd(42)} ${chalk.dim(`~${s.totalEstimatedTokens.toLocaleString()} tokens`)}`,
+          value: s.id,
+        })),
+        { name: chalk.dim('← Back'), value: '__back' },
+      ],
+      theme: { prefix: chalk.cyan('?') },
+    });
+
+    if (action === '__back') {
+      process.exit(0);
+    }
+
+    const picked = currentSessions.find((s) => s.id === action);
+
+    const sessionAction = await select({
+      message: `"${truncate(picked.label, 30)}"`,
+      choices: [
+        { name: chalk.green('Resume'), value: 'resume' },
+        { name: chalk.red('Delete'), value: 'delete' },
+        { name: chalk.dim('← Back'), value: 'back' },
+      ],
+      theme: { prefix: chalk.cyan('?') },
+    });
+
+    if (sessionAction === 'resume') {
+      await showSessionHistory(picked);
+      return picked;
+    } else if (sessionAction === 'delete') {
+      const sure = await confirm({
+        message: 'Delete this session?',
+        default: false,
+        theme: { prefix: chalk.red('!') },
+      });
+      if (sure) {
+        deleteSession(picked.id);
+        console.log(chalk.dim('  Deleted.\n'));
+      }
+    }
+    // 'back' loops again
+  }
+}
+
+// ── Show conversation history ─────────────────────
+
+async function showSessionHistory(session) {
+  if (!session.tasks || session.tasks.length === 0) {
+    console.log(chalk.dim('  No conversation history.\n'));
+    return;
+  }
+
+  const show = await confirm({
+    message: 'Show previous conversation?',
+    default: true,
+    theme: { prefix: chalk.cyan('?') },
+  });
+
+  if (!show) return;
+
+  // Let user pick which prompts to expand
+  while (true) {
+    const choices = session.tasks.map((t, i) => {
+      const modeConfig = MODES[t.mode] || { name: t.mode, color: 'white' };
+      return {
+        name: chalk.bold.cyan('> ') + t.task + chalk.dim(`  [${modeConfig.name}, ~${(t.estimatedTokens || 0).toLocaleString()} tokens]`),
+        value: i,
+      };
+    });
+
+    choices.push({ name: chalk.dim('← Continue'), value: '__done' });
+
+    const picked = await select({
+      message: 'Select a prompt to see its answer',
+      choices,
+      theme: { prefix: chalk.cyan('?') },
+    });
+
+    if (picked === '__done') break;
+
+    const task = session.tasks[picked];
+    console.log('');
+    console.log(chalk.bold.cyan('  > ') + task.task);
+    console.log('');
+    if (task.response) {
+      console.log(task.response);
+    } else {
+      console.log(chalk.dim('  (no response saved)'));
+    }
+    console.log('');
+    console.log(chalk.dim('─'.repeat(50)));
+    console.log('');
+  }
+}
+
+// ── Session picker (on start) ─────────────────────
+
+async function pickSession() {
+  const sessions = listSessions();
+
+  if (sessions.length === 0) {
+    return createSession();
+  }
+
+  const choice = await select({
+    message: 'Session',
+    choices: [
+      { name: chalk.green('+ New session'), value: '__new' },
+      ...sessions.slice(0, 5).map((s) => ({
+        name: `${chalk.dim(formatTime(s.lastActiveAt).padEnd(8))} ${truncate(s.label, 40).padEnd(42)} ${chalk.dim(`~${s.totalEstimatedTokens.toLocaleString()} tokens`)}`,
+        value: s.id,
+      })),
+      ...(sessions.length > 5
+        ? [{ name: chalk.dim(`  ... ${sessions.length - 5} more (use cw -h)`), value: '__new' }]
+        : []),
+    ],
+    theme: { prefix: chalk.cyan('?') },
+  });
+
+  if (choice === '__new') {
+    return createSession();
+  }
+
+  const resumed = readSession(choice);
+  await showSessionHistory(resumed);
+  return resumed;
+}
+
+// ── Main prompt loop ──────────────────────────────
+
+async function promptLoop(session) {
+  while (true) {
     const task = await input({
       message: 'Prompt:',
       theme: { prefix: chalk.cyan('?') },
@@ -72,7 +259,11 @@ async function promptLoop() {
 
     if (!task.trim()) continue;
 
-    // Pick mode
+    // Set label from first prompt
+    if (session.tasks.length === 0) {
+      session.label = task.length > 60 ? task.slice(0, 59) + '…' : task;
+    }
+
     const mode = await select({
       message: 'Mode:',
       choices: MODE_CHOICES,
@@ -81,28 +272,29 @@ async function promptLoop() {
 
     const modeConfig = MODES[mode];
 
-    // Show summary
     console.log('');
     console.log(chalk.dim('  Mode: ') + chalk[modeConfig.color](modeConfig.name));
     console.log('');
 
-    // Build prompt and run
-    const prompt = `[MODE: ${modeConfig.name.toUpperCase()}] ${modeConfig.instruction}\n\nTask: ${task}`;
-    const output = await runClaude(prompt);
+    const prompt = `[MODE: ${modeConfig.name.toUpperCase()}] ${modeConfig.instruction}\n\n${task}`;
+    const result = await runClaude(prompt, session.claudeSessionId);
 
-    // Estimate tokens
-    const tokens = estimateTokens(output);
+    if (result.sessionId) {
+      session.claudeSessionId = result.sessionId;
+    }
+
+    const tokens = estimateTokens(result.text);
     session.totalEstimatedTokens = (session.totalEstimatedTokens || 0) + tokens;
     session.tasks.push({
       task,
       mode,
       timestamp: new Date().toISOString(),
       estimatedTokens: tokens,
+      response: result.text,
     });
     writeSession(session);
 
-    // Show token footer
-    console.log('');
+    console.log('\n');
     console.log(chalk.dim('─'.repeat(50)));
     console.log(
       chalk.dim('  est. ') +
@@ -114,7 +306,30 @@ async function promptLoop() {
   }
 }
 
-promptLoop().catch((err) => {
+// ── Entry point ───────────────────────────────────
+
+async function main() {
+  const args = process.argv.slice(2);
+
+  console.log(chalk.bold('\n  cw') + chalk.dim(' — cost-aware Claude Code'));
+  console.log(chalk.dim('  ctrl+c to exit\n'));
+
+  // Handle flags
+  if (args.includes('-h') || args.includes('--history')) {
+    const resumed = await showHistory();
+    if (resumed) {
+      console.log(chalk.dim(`  Resuming: ${resumed.label}\n`));
+      await promptLoop(resumed);
+    }
+    return;
+  }
+
+  // Normal flow: pick or create session
+  const session = await pickSession();
+  await promptLoop(session);
+}
+
+main().catch((err) => {
   if (err.name === 'ExitPromptError') {
     console.log(chalk.dim('\n  Session ended.\n'));
     process.exit(0);
