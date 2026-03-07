@@ -44,12 +44,3 @@ Wait for the user to reply with their choice before proceeding.
 - Run tests if available.
 - Verify changes before reporting done.
 
-## Step 4: Completion
-
-When the task is done, always end with an estimated token count.
-Calculate: count the characters in your entire response (excluding this footer), divide by 3.5, round to nearest 10.
-
-```
----
-Mode: [Quick/Normal/Deep] | ~[X] tokens (est.)
-```

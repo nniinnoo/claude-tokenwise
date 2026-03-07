@@ -13,7 +13,41 @@ import {
 } from '../lib/tracker.js';
 import { spawn } from 'child_process';
 import { createInterface } from 'readline';
+import { readFileSync, writeFileSync } from 'fs';
+import { join } from 'path';
+import { homedir } from 'os';
 import ora from 'ora';
+
+const CLAUDE_SETTINGS_PATH = join(homedir(), '.claude', 'settings.json');
+
+const MODEL_DISPLAY = {
+  sonnet: 'Sonnet 4.6',
+  opus: 'Opus 4.6',
+  haiku: 'Haiku 4.5',
+};
+
+function displayModelName(key) {
+  return MODEL_DISPLAY[key] || key;
+}
+
+function readClaudeModel() {
+  try {
+    const settings = JSON.parse(readFileSync(CLAUDE_SETTINGS_PATH, 'utf-8'));
+    return settings.model || null;
+  } catch {
+    return null;
+  }
+}
+
+function writeClaudeModel(model) {
+  try {
+    const settings = JSON.parse(readFileSync(CLAUDE_SETTINGS_PATH, 'utf-8'));
+    settings.model = model;
+    writeFileSync(CLAUDE_SETTINGS_PATH, JSON.stringify(settings, null, 2));
+  } catch {
+    // silently fail
+  }
+}
 import { marked } from 'marked';
 import { markedTerminal } from 'marked-terminal';
 
@@ -33,9 +67,14 @@ marked.use(markedTerminal({
 // ── Custom input with ghost text autocomplete ─────
 
 const AUTOCOMPLETE_RULES = [
-  { trigger: 'quit', completion: 'cw', full: 'quitcw' },
-  { trigger: 'cw', completion: 'quit', full: 'cwquit' },
-  { trigger: 'cw', completion: 'history', full: 'cwhistory' },
+  { trigger: 'quit', completion: 'ctw', full: 'quitctw' },
+  { trigger: 'ctw', completion: 'quit', full: 'ctwquit' },
+  { trigger: 'ctw', completion: 'history', full: 'ctwhistory' },
+  { trigger: 'ctw', completion: 'help', full: 'ctwhelp' },
+  { trigger: 'ctw', completion: 'cost', full: 'ctwcost' },
+  { trigger: 'ctw', completion: 'clear', full: 'ctwclear' },
+  { trigger: 'ctw', completion: 'mode', full: 'ctwmode' },
+  { trigger: 'ctw', completion: 'model', full: 'ctwmodel' },
 ];
 
 function promptInput(label) {
@@ -166,11 +205,17 @@ function randomPhrase() {
   return THINKING_PHRASES[Math.floor(Math.random() * THINKING_PHRASES.length)];
 }
 
-function runClaude(prompt, claudeSessionId, silent = false) {
+function runClaude(prompt, claudeSessionId, silent = false, model = null, effort = null) {
   return new Promise((resolve) => {
     const args = ['-p', prompt, '--output-format', 'json'];
     if (claudeSessionId) {
       args.push('-r', claudeSessionId);
+    }
+    if (model) {
+      args.push('--model', model);
+    }
+    if (effort) {
+      args.push('--effort', effort);
     }
 
     const startTime = Date.now();
@@ -459,7 +504,7 @@ async function pickSession() {
         value: s.id,
       })),
       ...(sessions.length > 5
-        ? [{ name: chalk.dim(`  ... ${sessions.length - 5} more (use cw -h)`), value: '__manage' }]
+        ? [{ name: chalk.dim(`  ... ${sessions.length - 5} more (use ctw -h)`), value: '__manage' }]
         : []),
     ],
     theme: { prefix: chalk.cyan('?') },
@@ -494,17 +539,121 @@ async function promptLoop(session) {
     const lowerTask = task.trim().toLowerCase();
 
     // Exit keywords
-    if (lowerTask === 'quitcw' || lowerTask === 'cwquit') {
+    if (lowerTask === 'quitctw' || lowerTask === 'ctwquit') {
       console.log(chalk.dim('  Session ended.\n'));
       process.exit(0);
     }
 
     // History keyword
-    if (lowerTask === 'cwhistory') {
+    if (lowerTask === 'ctwhistory') {
       const resumed = await manageSessions();
       if (resumed) {
         console.log(chalk.dim(`\n  Switched to session: ${resumed.label}\n`));
-        session = resumed; // Update current session context
+        session = resumed;
+      }
+      continue;
+    }
+
+    // Help keyword
+    if (lowerTask === 'ctwhelp') {
+      console.log(chalk.bold('\n  Keywords\n'));
+      console.log(chalk.cyan('  ctwhelp') + chalk.dim('     Show this help'));
+      console.log(chalk.cyan('  ctwcost') + chalk.dim('     Show session token stats'));
+      console.log(chalk.cyan('  ctwclear') + chalk.dim('    Start fresh context, keep session'));
+      console.log(chalk.cyan('  ctwmode') + chalk.dim('     Change default mode'));
+      console.log(chalk.cyan('  ctwmodel') + chalk.dim('    Show/change model'));
+      console.log(chalk.cyan('  ctwhistory') + chalk.dim('  Open session manager'));
+      console.log(chalk.cyan('  ctwquit') + chalk.dim('     Exit session'));
+      console.log('');
+      continue;
+    }
+
+    // Cost keyword
+    if (lowerTask === 'ctwcost') {
+      console.log(chalk.bold('\n  Session stats\n'));
+      console.log(chalk.dim('  Prompts: ') + chalk.bold(session.tasks.length));
+      console.log(chalk.dim('  Est. total: ') + chalk.bold(`~${(session.totalEstimatedTokens || 0).toLocaleString()} tokens`));
+      if (session.exactTokens) {
+        console.log(chalk.dim('  Context: ') + chalk.bold(session.exactTokens));
+      }
+      if (session.model) {
+        console.log(chalk.dim('  Model: ') + chalk.bold(displayModelName(session.model)));
+      }
+      console.log('');
+      continue;
+    }
+
+    // Clear keyword
+    if (lowerTask === 'ctwclear') {
+      session.claudeSessionId = null;
+      console.log(chalk.dim('\n  Context cleared. Next prompt starts a fresh Claude session.\n'));
+      continue;
+    }
+
+    // Mode keyword
+    if (lowerTask === 'ctwmode') {
+      const picked = await select({
+        message: 'Default mode:',
+        choices: [
+          ...MODE_CHOICES.filter((c) => c.value !== '__exit'),
+          { name: chalk.dim('No default (ask each time)'), value: '__none' },
+        ],
+        theme: { prefix: chalk.cyan('?') },
+      });
+      session.defaultMode = picked === '__none' ? null : picked;
+      if (session.defaultMode) {
+        const mc = MODES[session.defaultMode];
+        console.log(chalk.dim('\n  Default mode set to ') + chalk[mc.color](mc.name) + '\n');
+      } else {
+        console.log(chalk.dim('\n  Default mode cleared.\n'));
+      }
+      continue;
+    }
+
+    // Model keyword — reads/writes ~/.claude/settings.json to stay in sync with Claude's /model
+    if (lowerTask === 'ctwmodel') {
+      const currentModel = readClaudeModel();
+      const models = [
+        { key: 'sonnet', label: 'Sonnet', color: 'green', desc: 'Sonnet 4.6 · Best for everyday tasks', hasEffort: true },
+        { key: 'opus', label: 'Opus', color: 'red', desc: 'Opus 4.6 · Most capable for complex work', hasEffort: true },
+        { key: 'haiku', label: 'Haiku', color: 'yellow', desc: 'Haiku 4.5 · Fastest for quick answers', hasEffort: false },
+      ];
+      const action = await select({
+        message: 'Model:',
+        choices: [
+          ...models.map((m) => ({
+            name: `${chalk[m.color](m.label.padEnd(8))}${chalk.dim('— ' + m.desc)}${currentModel === m.key ? chalk.green(' ✔') : ''}`,
+            value: m.key,
+          })),
+          { name: chalk.dim('Keep current'), value: '__keep' },
+        ],
+        theme: { prefix: chalk.cyan('?') },
+      });
+      if (action !== '__keep') {
+        const selectedModel = models.find((m) => m.key === action);
+        let effort = session.effort || 'medium';
+        if (selectedModel.hasEffort) {
+          const effortBlocks = { low: '▌', medium: '▌▌▌', high: '▌▌▌▌▌' };
+          effort = await select({
+            message: 'Effort:',
+            choices: [
+              { name: `${chalk.dim(effortBlocks.low)}   ${chalk.dim('Low')}`, value: 'low' },
+              { name: `${chalk.bold(effortBlocks.medium)} ${chalk.dim('Medium (default)')}`, value: 'medium' },
+              { name: `${chalk.bold(effortBlocks.high)} ${chalk.dim('High')}`, value: 'high' },
+            ],
+            theme: { prefix: chalk.cyan('?') },
+          });
+        }
+        writeClaudeModel(action);
+        session.model = action;
+        session.effort = effort;
+        console.log(
+          chalk.dim('  Model: ') + chalk.bold(displayModelName(action)) +
+          (selectedModel.hasEffort ? chalk.dim(' · Effort: ') + chalk.bold(effort) : '') +
+          '\n'
+        );
+      } else {
+        console.log('');
       }
       continue;
     }
@@ -514,25 +663,34 @@ async function promptLoop(session) {
       session.label = task.length > 60 ? task.slice(0, 59) + '…' : task;
     }
 
-    const mode = await select({
-      message: 'Mode:',
-      choices: MODE_CHOICES,
-      theme: { prefix: chalk.cyan('?') },
-    });
+    let mode;
+    if (session.defaultMode) {
+      mode = session.defaultMode;
+    } else {
+      mode = await select({
+        message: 'Mode:',
+        choices: MODE_CHOICES,
+        theme: { prefix: chalk.cyan('?') },
+      });
 
-    if (mode === '__exit') {
-      console.log(chalk.dim('\n  Session ended.\n'));
-      process.exit(0);
+      if (mode === '__exit') {
+        console.log(chalk.dim('\n  Session ended.\n'));
+        process.exit(0);
+      }
     }
 
     const modeConfig = MODES[mode];
 
     console.log('');
-    console.log(chalk.dim('  Mode: ') + chalk[modeConfig.color](modeConfig.name));
+    const activeModel = session.model || readClaudeModel();
+    console.log(
+      chalk.dim('  Mode: ') + chalk[modeConfig.color](modeConfig.name) +
+      (activeModel ? chalk.dim('  Model: ') + chalk.bold(displayModelName(activeModel)) : '')
+    );
     console.log('');
 
     const prompt = `[MODE: ${modeConfig.name.toUpperCase()}] ${modeConfig.instruction}\n\n${task}`;
-    const result = await runClaude(prompt, session.claudeSessionId);
+    const result = await runClaude(prompt, session.claudeSessionId, false, session.model, session.effort);
 
     if (result.sessionId) {
       session.claudeSessionId = result.sessionId;
@@ -548,6 +706,7 @@ async function promptLoop(session) {
       session.exactTokens = parsedContext;
     }
 
+
     session.tasks.push({
       task,
       mode,
@@ -560,25 +719,18 @@ async function promptLoop(session) {
     console.log('\n');
     console.log(chalk.dim('─'.repeat(50)));
 
-    if (session.exactTokens) {
-      console.log(
-        chalk.dim('  est. ') +
-        chalk.bold(`~${tokens.toLocaleString()} tokens`) +
-        chalk.dim(' | total: ') +
-        chalk.bold(`~${session.totalEstimatedTokens.toLocaleString()} tokens`) +
-        chalk.dim(' | context: ') +
-        chalk.bold(`${session.exactTokens}`) +
-        chalk.dim(' | ctrl+c to exit')
-      );
-    } else {
-      console.log(
-        chalk.dim('  est. ') +
-        chalk.bold(`~${tokens.toLocaleString()} tokens`) +
-        chalk.dim(' | total: ') +
-        chalk.bold(`~${session.totalEstimatedTokens.toLocaleString()} tokens`) +
-        chalk.dim(' | ctrl+c to exit')
-      );
-    }
+    console.log(
+      chalk.dim('  est. ') +
+      chalk.bold(`~${tokens.toLocaleString()} tokens`) +
+      chalk.dim(' | total: ') +
+      chalk.bold(`~${session.totalEstimatedTokens.toLocaleString()} tokens`) +
+      (session.exactTokens ? chalk.dim(' | context: ') + chalk.bold(session.exactTokens) : '')
+    );
+    const displayModel = session.model || readClaudeModel();
+    console.log(
+      (displayModel ? chalk.dim('  model: ') + chalk.bold(displayModelName(displayModel)) : '') +
+      chalk.dim((displayModel ? ' | ' : '  ') + 'ctrl+c to exit')
+    );
 
     console.log('');
   }
@@ -589,7 +741,8 @@ async function promptLoop(session) {
 async function main() {
   const args = process.argv.slice(2);
 
-  console.log(chalk.bold('\n  cw') + chalk.dim(' — cost-aware Claude Code'));
+  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf-8'));
+  console.log(chalk.bold('\n  ctw') + chalk.dim(` v${pkg.version} — cost-aware Claude Code`));
   console.log(chalk.dim('  ctrl+c to exit\n'));
 
   // Handle flags
