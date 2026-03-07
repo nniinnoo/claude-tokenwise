@@ -1,0 +1,26 @@
+{
+  "name": "claude-tokenwise",
+  "version": "1.0.0",
+  "description": "Interactive cost-aware workflow for Claude Code. Like commitizen, but for AI token spend.",
+  "type": "module",
+  "bin": {
+    "cw": "./bin/tokenwise.js"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "claude",
+    "claude-code",
+    "tokens",
+    "cost",
+    "ai",
+    "cli"
+  ],
+  "author": "nniinnoo",
+  "license": "MIT",
+  "dependencies": {
+    "@inquirer/prompts": "^7.10.1",
+    "chalk": "^5.6.2"
+  }
+}
