@@ -11,6 +11,90 @@ import {
   estimateTokens,
 } from '../lib/tracker.js';
 import { spawn } from 'child_process';
+import { createInterface } from 'readline';
+import ora from 'ora';
+
+// ── Custom input with ghost text autocomplete ─────
+
+const AUTOCOMPLETE_RULES = [
+  { trigger: 'quit', completion: 'cw', full: 'quitcw' },
+];
+
+function promptInput(label) {
+  return new Promise((resolve) => {
+    const prefix = chalk.cyan('? ') + chalk.bold(label) + ' ';
+    process.stdout.write(prefix);
+
+    const rl = createInterface({
+      input: process.stdin,
+      output: process.stdout,
+      terminal: true,
+    });
+
+    // Hide default output — we render manually
+    rl.output = { write: () => {} };
+
+    let current = '';
+
+    function render() {
+      // Clear line and rewrite
+      process.stdout.write(`\r\x1b[K${prefix}${current}`);
+
+      // Check for ghost text
+      const rule = AUTOCOMPLETE_RULES.find(
+        (r) => r.trigger.startsWith(current) && current.length > 0 && current.length < r.full.length
+      );
+      if (rule) {
+        const ghost = rule.full.slice(current.length);
+        process.stdout.write(chalk.dim(ghost));
+        // Move cursor back to end of actual input
+        process.stdout.write(`\x1b[${ghost.length}D`);
+      }
+    }
+
+    process.stdin.setRawMode(true);
+    process.stdin.resume();
+
+    const onKeypress = (chunk) => {
+      const key = chunk.toString();
+
+      if (key === '\r' || key === '\n') {
+        // Enter
+        process.stdin.setRawMode(false);
+        process.stdin.removeListener('data', onKeypress);
+        process.stdout.write('\n');
+        rl.close();
+        resolve(current);
+      } else if (key === '\t') {
+        // Tab — autocomplete
+        const rule = AUTOCOMPLETE_RULES.find(
+          (r) => r.trigger.startsWith(current) && current.length > 0
+        );
+        if (rule) {
+          current = rule.full;
+        }
+        render();
+      } else if (key === '\x7f' || key === '\b') {
+        // Backspace
+        current = current.slice(0, -1);
+        render();
+      } else if (key === '\x03') {
+        // Ctrl+C
+        process.stdin.setRawMode(false);
+        rl.close();
+        console.log(chalk.dim('\n\n  Session ended.\n'));
+        process.exit(0);
+      } else if (key >= ' ' && key <= '~') {
+        // Printable character
+        current += key;
+        render();
+      }
+    };
+
+    process.stdin.on('data', onKeypress);
+    render();
+  });
+}
 
 const MODES = {
   quick: {
@@ -43,7 +127,26 @@ const MODE_CHOICES = [
     name: `${chalk.red('Deep')}    ${chalk.dim('— Thorough & careful. Most tokens.')}`,
     value: 'deep',
   },
+  {
+    name: chalk.dim('Exit'),
+    value: '__exit',
+  },
 ];
+
+const THINKING_PHRASES = [
+  'Thinking',
+  'Reasoning',
+  'Analyzing',
+  'Cogitating',
+  'Processing',
+  'Considering',
+  'Reflecting',
+  'Evaluating',
+];
+
+function randomPhrase() {
+  return THINKING_PHRASES[Math.floor(Math.random() * THINKING_PHRASES.length)];
+}
 
 function runClaude(prompt, claudeSessionId) {
   return new Promise((resolve) => {
@@ -51,6 +154,29 @@ function runClaude(prompt, claudeSessionId) {
     if (claudeSessionId) {
       args.push('-r', claudeSessionId);
     }
+
+    const startTime = Date.now();
+    let currentPhrase = randomPhrase();
+    const spinner = ora({
+      text: chalk.dim(`${currentPhrase}...`),
+      spinner: {
+        interval: 120,
+        frames: ['✻', '✼', '✽', '✾', '✿', '❀', '❁', '❂'],
+      },
+      color: 'cyan',
+    }).start();
+
+    // Update spinner with elapsed time and rotating phrases
+    let phraseCounter = 0;
+    const timer = setInterval(() => {
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      phraseCounter++;
+      // Change phrase every 4 seconds
+      if (phraseCounter % 4 === 0) {
+        currentPhrase = randomPhrase();
+      }
+      spinner.text = chalk.dim(`${currentPhrase} for ${elapsed}s...`);
+    }, 1000);
 
     const claude = spawn('claude', args, {
       stdio: ['inherit', 'pipe', 'inherit'],
@@ -64,6 +190,14 @@ function runClaude(prompt, claudeSessionId) {
     });
 
     claude.on('close', () => {
+      clearInterval(timer);
+      const elapsed = Math.floor((Date.now() - startTime) / 1000);
+      spinner.stopAndPersist({
+        symbol: chalk.cyan('✻'),
+        text: chalk.dim(`${currentPhrase} took ${elapsed}s`),
+      });
+      console.log('');
+
       let text = '';
       let sessionId = null;
 
@@ -252,12 +386,15 @@ async function pickSession() {
 
 async function promptLoop(session) {
   while (true) {
-    const task = await input({
-      message: 'Prompt:',
-      theme: { prefix: chalk.cyan('?') },
-    });
+    const task = await promptInput('Prompt:');
 
     if (!task.trim()) continue;
+
+    // Exit keyword
+    if (task.trim().toLowerCase() === 'quitcw') {
+      console.log(chalk.dim('  Session ended.\n'));
+      process.exit(0);
+    }
 
     // Set label from first prompt
     if (session.tasks.length === 0) {
@@ -269,6 +406,11 @@ async function promptLoop(session) {
       choices: MODE_CHOICES,
       theme: { prefix: chalk.cyan('?') },
     });
+
+    if (mode === '__exit') {
+      console.log(chalk.dim('\n  Session ended.\n'));
+      process.exit(0);
+    }
 
     const modeConfig = MODES[mode];
 
@@ -300,7 +442,8 @@ async function promptLoop(session) {
       chalk.dim('  est. ') +
       chalk.bold(`~${tokens.toLocaleString()} tokens`) +
       chalk.dim(' | total: ') +
-      chalk.bold(`~${session.totalEstimatedTokens.toLocaleString()} tokens`)
+      chalk.bold(`~${session.totalEstimatedTokens.toLocaleString()} tokens`) +
+      chalk.dim(' | ctrl+c to exit')
     );
     console.log('');
   }
