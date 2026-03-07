@@ -9,6 +9,7 @@ import {
   listSessions,
   deleteSession,
   estimateTokens,
+  parseContextTokens,
 } from '../lib/tracker.js';
 import { spawn } from 'child_process';
 import { createInterface } from 'readline';
@@ -165,7 +166,7 @@ function randomPhrase() {
   return THINKING_PHRASES[Math.floor(Math.random() * THINKING_PHRASES.length)];
 }
 
-function runClaude(prompt, claudeSessionId) {
+function runClaude(prompt, claudeSessionId, silent = false) {
   return new Promise((resolve) => {
     const args = ['-p', prompt, '--output-format', 'json'];
     if (claudeSessionId) {
@@ -174,26 +175,29 @@ function runClaude(prompt, claudeSessionId) {
 
     const startTime = Date.now();
     let currentPhrase = randomPhrase();
-    const spinner = ora({
-      text: chalk.dim(`${currentPhrase}...`),
-      spinner: {
-        interval: 120,
-        frames: ['✻', '✼', '✽', '✾', '✿', '❀', '❁', '❂'],
-      },
-      color: 'cyan',
-    }).start();
+    let spinner = null;
+    let timer = null;
 
-    // Update spinner with elapsed time and rotating phrases
-    let phraseCounter = 0;
-    const timer = setInterval(() => {
-      const elapsed = Math.floor((Date.now() - startTime) / 1000);
-      phraseCounter++;
-      // Change phrase every 4 seconds
-      if (phraseCounter % 4 === 0) {
-        currentPhrase = randomPhrase();
-      }
-      spinner.text = chalk.dim(`${currentPhrase} for ${elapsed}s...`);
-    }, 1000);
+    if (!silent) {
+      spinner = ora({
+        text: chalk.dim(`${currentPhrase}...`),
+        spinner: {
+          interval: 120,
+          frames: ['✻', '✼', '✽', '✾', '✿', '❀', '❁', '❂'],
+        },
+        color: 'cyan',
+      }).start();
+
+      let phraseCounter = 0;
+      timer = setInterval(() => {
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        phraseCounter++;
+        if (phraseCounter % 4 === 0) {
+          currentPhrase = randomPhrase();
+        }
+        spinner.text = chalk.dim(`${currentPhrase} for ${elapsed}s...`);
+      }, 1000);
+    }
 
     const claude = spawn('claude', args, {
       stdio: ['inherit', 'pipe', 'inherit'],
@@ -207,13 +211,15 @@ function runClaude(prompt, claudeSessionId) {
     });
 
     claude.on('close', () => {
-      clearInterval(timer);
-      const elapsed = Math.floor((Date.now() - startTime) / 1000);
-      spinner.stopAndPersist({
-        symbol: chalk.cyan('✻'),
-        text: chalk.dim(`${currentPhrase} took ${elapsed}s`),
-      });
-      console.log('');
+      if (!silent) {
+        clearInterval(timer);
+        const elapsed = Math.floor((Date.now() - startTime) / 1000);
+        spinner.stopAndPersist({
+          symbol: chalk.cyan('✻'),
+          text: chalk.dim(`${currentPhrase} took ${elapsed}s`),
+        });
+        console.log('');
+      }
 
       let text = '';
       let sessionId = null;
@@ -226,7 +232,9 @@ function runClaude(prompt, claudeSessionId) {
         text = rawOutput;
       }
 
-      console.log(marked.parse(text));
+      if (!silent) {
+        console.log(marked.parse(text));
+      }
       resolve({ text, sessionId });
     });
   });
@@ -273,7 +281,7 @@ async function showHistory() {
       message: 'Pick a session',
       choices: [
         ...currentSessions.map((s) => ({
-          name: `${chalk.dim(formatTime(s.lastActiveAt).padEnd(8))} ${truncate(s.label, 40).padEnd(42)} ${chalk.dim(`~${s.totalEstimatedTokens.toLocaleString()} tokens`)}`,
+          name: `${chalk.dim(formatTime(s.lastActiveAt).padEnd(8))} ${truncate(s.label, 40).padEnd(42)} ${chalk.dim(`~${(s.totalEstimatedTokens || 0).toLocaleString()} tokens`)}${s.exactTokens ? chalk.dim(` [${s.exactTokens}]`) : ''}`,
           value: s.id,
         })),
         { name: chalk.dim('← Back'), value: '__back' },
@@ -335,7 +343,7 @@ async function manageSessions() {
     const selections = await checkbox({
       message: 'Select sessions to manage',
       choices: currentSessions.map((s) => ({
-        name: `${chalk.dim(formatTime(s.lastActiveAt).padEnd(8))} ${truncate(s.label, 40).padEnd(42)}`,
+        name: `${chalk.dim(formatTime(s.lastActiveAt).padEnd(8))} ${truncate(s.label, 40).padEnd(42)} ${chalk.dim(`~${(s.totalEstimatedTokens || 0).toLocaleString()} tokens`)}${s.exactTokens ? chalk.dim(` [${s.exactTokens}]`) : ''}`,
         value: s.id,
       })),
       theme: { prefix: chalk.cyan('?') },
@@ -447,7 +455,7 @@ async function pickSession() {
       { name: chalk.green('+ New session'), value: '__new' },
       { name: chalk.blue('⚙ Manage sessions'), value: '__manage' },
       ...sessions.slice(0, 5).map((s) => ({
-        name: `${chalk.dim(formatTime(s.lastActiveAt).padEnd(8))} ${truncate(s.label, 40).padEnd(42)} ${chalk.dim(`~${s.totalEstimatedTokens.toLocaleString()} tokens`)}`,
+        name: `${chalk.dim(formatTime(s.lastActiveAt).padEnd(8))} ${truncate(s.label, 40).padEnd(42)} ${chalk.dim(`~${(s.totalEstimatedTokens || 0).toLocaleString()} tokens`)}${s.exactTokens ? chalk.dim(` [${s.exactTokens}]`) : ''}`,
         value: s.id,
       })),
       ...(sessions.length > 5
@@ -532,6 +540,14 @@ async function promptLoop(session) {
 
     const tokens = estimateTokens(result.text);
     session.totalEstimatedTokens = (session.totalEstimatedTokens || 0) + tokens;
+
+    // Fetch EXACT token bounds silently
+    const contextResult = await runClaude('/context', session.claudeSessionId, true);
+    const parsedContext = parseContextTokens(contextResult.text);
+    if (parsedContext) {
+      session.exactTokens = parsedContext;
+    }
+
     session.tasks.push({
       task,
       mode,
@@ -543,13 +559,27 @@ async function promptLoop(session) {
 
     console.log('\n');
     console.log(chalk.dim('─'.repeat(50)));
-    console.log(
-      chalk.dim('  est. ') +
-      chalk.bold(`~${tokens.toLocaleString()} tokens`) +
-      chalk.dim(' | total: ') +
-      chalk.bold(`~${session.totalEstimatedTokens.toLocaleString()} tokens`) +
-      chalk.dim(' | ctrl+c to exit')
-    );
+
+    if (session.exactTokens) {
+      console.log(
+        chalk.dim('  est. ') +
+        chalk.bold(`~${tokens.toLocaleString()} tokens`) +
+        chalk.dim(' | total: ') +
+        chalk.bold(`~${session.totalEstimatedTokens.toLocaleString()} tokens`) +
+        chalk.dim(' | context: ') +
+        chalk.bold(`${session.exactTokens}`) +
+        chalk.dim(' | ctrl+c to exit')
+      );
+    } else {
+      console.log(
+        chalk.dim('  est. ') +
+        chalk.bold(`~${tokens.toLocaleString()} tokens`) +
+        chalk.dim(' | total: ') +
+        chalk.bold(`~${session.totalEstimatedTokens.toLocaleString()} tokens`) +
+        chalk.dim(' | ctrl+c to exit')
+      );
+    }
+
     console.log('');
   }
 }

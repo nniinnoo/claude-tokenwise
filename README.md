@@ -1,90 +1,64 @@
-# claude-tokenwise
+# claude-tokenwise (cw)
 
-Interactive cost-aware workflow for Claude Code. Like [commitizen](https://github.com/commitizen/cz-cli), but for AI token spend.
+It's easy to burn through a Claude Code context window without realizing it. `cw` is an interactive wrapper around `claude` with a mode picker, session manager, and token tracker to keep usage visible as you work.
 
-Arrow-key mode selection, automatic token estimation, and session tracking — no commands to memorize.
-
-## Demo
-
-```
-$ cw
-
-  cw — cost-aware Claude Code
-
-? Prompt: fix the login bug
-
-? Choose a mode
-  > Quick   — Fast & minimal. Least tokens.
-    Normal  — Balanced. Standard workflow.
-    Deep    — Thorough & careful. Most tokens.
-
-  Task: fix the login bug
-  Mode: Quick
-
-  [Claude's response here...]
-
-──────────────────────────────────────────────────
-  est. ~120 tokens | session total: ~450 tokens
-```
-
-## Install
+## Installation
 
 ```bash
 npm install -g claude-cw
 ```
 
-Or run directly:
+Requires [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude` CLI) installed and authenticated.
+
+Or run without installing:
 
 ```bash
-npx claude-cw "fix the login bug"
+npx claude-cw
 ```
-
-Requires [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude` CLI) to be installed.
 
 ## Usage
 
 ```bash
-cw
+cw          # Start or resume a session
+cw -h       # Open session manager
 ```
 
-The CLI will:
-1. Ask you to pick a mode with arrow keys (Quick / Normal / Deep)
-2. Send the task to Claude Code with mode-appropriate instructions
-3. Show estimated token usage and running session total
+### Built-in keywords (in the prompt loop)
 
-## Modes
+| Keyword | Action |
+|---|---|
+| `cwhistory` | Open session manager mid-session |
+| `cwquit` or `quitcw` | Exit without saving the prompt |
 
-| Mode | Behavior | Token usage |
+Tab autocomplete is available — start typing `cw` and press `Tab`.
+
+## Session Modes
+
+Pick a mode each prompt to influence how Claude approaches the task:
+
+| Mode | Behavior | Token cost |
 |---|---|---|
-| **Quick** | Terse answers, no exploration, minimal tool calls | Lowest |
-| **Normal** | Standard workflow, reads files, brief updates | Moderate |
-| **Deep** | Reads everything, explains reasoning, runs tests | Highest |
+| **Quick** | Direct, minimal — avoids tangents and unnecessary reads | Lowest |
+| **Normal** | Standard workflow — reads relevant files, gives brief updates | Moderate |
+| **Deep** | Thorough — full file reads, explains reasoning, runs tests if available | Highest |
 
-## Session Tracking
+## Token Tracking
 
-Token estimates accumulate in `.claude/session.json`:
+**1. Response estimate** (`est. ~X tokens`)  
+Calculated from response character count using Anthropic's rough rule of thumb: `characters ÷ 3.5`. This is an intentional approximation. It only covers output text and does not include input tokens, system prompt, CLAUDE.md, or tool call overhead. The actual formula in `lib/tracker.js`:
 
-```json
-{
-  "startedAt": "2026-03-07T10:00:00.000Z",
-  "totalEstimatedTokens": 1250,
-  "tasks": [
-    {
-      "task": "fix the login bug",
-      "mode": "quick",
-      "timestamp": "2026-03-07T10:00:00.000Z",
-      "estimatedTokens": 120
-    }
-  ]
-}
+```js
+Math.round(text.length / 3.5 / 10) * 10
 ```
 
-## Advanced: CLAUDE.md integration
+**Why it fluctuates:** tokenization isn't linear. Common English words are often 1 token each; rare or technical terms get split into sub-tokens; code, whitespace, and punctuation follow entirely different patterns. Treat the estimate as a directional signal, not an exact count.
 
-For users who prefer working inside Claude Code directly (without the wrapper CLI), copy `CLAUDE.md` into your project. It adds an interactive prompt flow that triggers automatically for every task.
+**2. Context window usage** (`context: X / 200k`)  
+After each response, `cw` silently runs `/context` inside the same Claude session and parses the actual reported usage (e.g. `6.2k / 200k (3%)`). This is exact, because Claude itself reports it. It reflects the full window: system prompt, tools, memory files, messages, and free space.
 
-Slash commands are also available in `.claude/commands/` for power users.
+The running **total** (`total: ~Y tokens`) accumulates the response estimates across all prompts in the session, useful for a rough sense of session cost over time, even though the context window figure is more accurate per-request.
 
 ## License
 
 MIT
+
