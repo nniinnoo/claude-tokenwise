@@ -2,6 +2,12 @@
 
 It's easy to burn through a Claude Code context window without realizing it. `ctw` is an interactive wrapper around `claude` with a mode picker, session manager, and token tracker to keep usage visible as you work.
 
+## Demo
+
+![ctw demo](https://raw.githubusercontent.com/nniinnoo/claude-tokenwise/main/ctw-demo.gif)
+
+![ctw demo 2](https://raw.githubusercontent.com/nniinnoo/claude-tokenwise/main/ctw-demo-2.gif)
+
 ## Installation
 
 ```bash
